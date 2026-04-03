@@ -1,0 +1,1 @@
+a rust cli that find the closest pirate bay torrent, searces against it, downloads the best torrent, and download the files
