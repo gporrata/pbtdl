@@ -1,5 +1,6 @@
 use anyhow::{bail, Result};
-use std::path::Path;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// Try to find a supported downloader on PATH.
@@ -24,6 +25,8 @@ pub fn download(magnet: &str, output_dir: &Path) -> Result<()> {
         )
     })?;
 
+    let existing = snapshot_files(output_dir);
+
     let dir = output_dir.to_string_lossy();
     let status = match downloader {
         "aria2c" => Command::new("aria2c")
@@ -42,26 +45,38 @@ pub fn download(magnet: &str, output_dir: &Path) -> Result<()> {
         bail!("{} exited with status {}", downloader, status);
     }
 
-    print_downloaded_files(output_dir);
+    print_new_files(output_dir, &existing);
     Ok(())
 }
 
-fn print_downloaded_files(dir: &Path) {
-    let mut files: Vec<(std::path::PathBuf, u64)> = Vec::new();
-    collect_files(dir, &mut files);
-    if files.is_empty() {
-        println!("No files found in output directory.");
+fn snapshot_files(dir: &Path) -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    collect_files(dir, &mut |path, _| {
+        set.insert(path);
+    });
+    set
+}
+
+fn print_new_files(dir: &Path, existing: &HashSet<PathBuf>) {
+    let mut new_files: Vec<(PathBuf, u64)> = Vec::new();
+    collect_files(dir, &mut |path, size| {
+        if !existing.contains(&path) {
+            new_files.push((path, size));
+        }
+    });
+    if new_files.is_empty() {
+        println!("No new files downloaded.");
         return;
     }
-    files.sort_by(|a, b| a.0.cmp(&b.0));
+    new_files.sort_by(|a, b| a.0.cmp(&b.0));
     println!("\nDownloaded files:");
-    for (path, size) in &files {
+    for (path, size) in &new_files {
         let rel = path.strip_prefix(dir).unwrap_or(path);
         println!("  {}  ({})", rel.display(), human_size(*size));
     }
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<(std::path::PathBuf, u64)>) {
+fn collect_files(dir: &Path, f: &mut impl FnMut(PathBuf, u64)) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -69,9 +84,9 @@ fn collect_files(dir: &Path, out: &mut Vec<(std::path::PathBuf, u64)>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_files(&path, out);
+            collect_files(&path, f);
         } else if let Ok(meta) = entry.metadata() {
-            out.push((path, meta.len()));
+            f(path, meta.len());
         }
     }
 }
