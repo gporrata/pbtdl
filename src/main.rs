@@ -1,10 +1,10 @@
 mod download;
 mod search;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Parser;
 use console::style;
-use dialoguer::{theme::ColorfulTheme, Select};
+use dialoguer::{Select, theme::ColorfulTheme};
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -34,7 +34,11 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    println!("{} {}", style("Searching for:").bold(), style(&cli.query).cyan());
+    println!(
+        "{} {}",
+        style("Searching for:").bold(),
+        style(&cli.query).cyan()
+    );
 
     let torrents = search::search(&cli.query).await?;
 
@@ -51,9 +55,12 @@ async fn main() -> Result<()> {
             .iter()
             .map(|t| {
                 format!(
-                    "{:<60} {:>6} seeders  {}",
+                    "{:<60} {:>6} seeders  {:>6} leechers  {:<8} {:<8} {}",
                     truncate(&t.name, 60),
                     t.seeders,
+                    t.leechers,
+                    t.source,
+                    truncate(&t.category, 8),
                     t.size_human()
                 )
             })
@@ -83,9 +90,5 @@ async fn main() -> Result<()> {
 }
 
 fn truncate(s: &str, max: usize) -> &str {
-    if s.len() <= max {
-        s
-    } else {
-        &s[..max]
-    }
+    if s.len() <= max { s } else { &s[..max] }
 }

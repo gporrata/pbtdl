@@ -45,9 +45,26 @@ pbtdl "ubuntu 24.04" --auto
 
 ## How It Works
 
-1. **Search** — queries `apibay.org` and sorts results by seeder count descending.
+1. **Search** — queries public torrent indexes and sorts results by seeder count descending.
 2. **Select** — presents an interactive list (via [dialoguer](https://github.com/console-rs/dialoguer)) so you can pick the right release. Use `--auto` to skip this step.
 3. **Download** — constructs a magnet URI from the torrent's info hash and hands it off to your installed downloader (`aria2c`, `transmission-cli`, or `qbittorrent-nox`).
+
+## Search Indexes
+
+`pbtdl` is designed to use public HTTP indexes directly, so users do not need to run a separate indexer service.
+
+Built-in providers:
+
+- APibay-compatible Pirate Bay API: JSON results from `/q.php`.
+- EZTV RSS: TV-oriented RSS results with magnet metadata.
+
+If `https://apibay.org` is blocked or down, set one or more APibay-compatible base URLs:
+
+```sh
+PBTDL_APIBAY_BASES="https://apibay.example,https://another.example" pbtdl "ubuntu"
+```
+
+Good candidates for future built-in providers are public indexes with stable RSS or JSON search endpoints that include either a magnet link or info hash. Scrape-only sites are intentionally avoided because they tend to break behind bot protection and markup changes.
 
 ## Project Structure
 
