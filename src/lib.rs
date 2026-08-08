@@ -1,5 +1,6 @@
 //! Core library for the `pbtdl` command-line application.
 
+pub mod app;
 pub mod browser;
 pub mod cli;
 pub mod config;

@@ -124,6 +124,9 @@ impl AppConfig {
         if let Some(limit) = cli.results {
             self.search.result_limit = limit;
         }
+        if cli.headful {
+            self.browser.headless = false;
+        }
     }
 
     fn apply_document(&mut self, document: ConfigDocument) -> Result<()> {

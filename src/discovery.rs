@@ -174,8 +174,12 @@ pub struct DiscoveryEngine {
 
 impl DiscoveryEngine {
     pub fn production(cache_dir: &Path) -> Self {
+        Self::with_policy(cache_dir, NavigationPolicy::production())
+    }
+
+    pub(crate) fn with_policy(cache_dir: &Path, policy: NavigationPolicy) -> Self {
         Self {
-            policy: NavigationPolicy::production(),
+            policy,
             cache_file: cache_dir.join(CACHE_FILE_NAME),
             now_seconds: unix_time_seconds(),
         }

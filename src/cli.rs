@@ -21,6 +21,14 @@ pub struct Cli {
     #[arg(long)]
     pub auto: bool,
 
+    /// Stop after selecting a result; never invoke a torrent client.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Show the browser window for deterministic troubleshooting.
+    #[arg(long)]
+    pub headful: bool,
+
     /// Use this configuration file instead of the XDG default.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
@@ -41,6 +49,8 @@ mod tests {
             "--results",
             "5",
             "--auto",
+            "--dry-run",
+            "--headful",
             "--config",
             "/tmp/pbtdl.toml",
         ])
@@ -50,6 +60,8 @@ mod tests {
         assert_eq!(cli.output, Some(PathBuf::from("/tmp/downloads")));
         assert_eq!(cli.results.map(NonZeroUsize::get), Some(5));
         assert!(cli.auto);
+        assert!(cli.dry_run);
+        assert!(cli.headful);
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/pbtdl.toml")));
     }
 
