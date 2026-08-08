@@ -1,6 +1,6 @@
 //! Terminal result presentation and deterministic selection.
 
-use crate::model::TorrentResult;
+use crate::model::{TorrentResult, sanitize_display_text};
 use anyhow::{Context, Result, bail};
 use dialoguer::{Select, theme::ColorfulTheme};
 
@@ -44,20 +44,29 @@ impl ResultChooser for TerminalChooser {
 }
 
 pub fn format_result(result: &TorrentResult, max_title_characters: usize) -> String {
-    let title = truncate_with_ellipsis(&result.name, max_title_characters);
+    let title = truncate_with_ellipsis(
+        &sanitize_display_text(&result.name, max_title_characters.saturating_add(1)),
+        max_title_characters,
+    );
     let seeders = result
         .seeders
         .map_or_else(|| "?".to_string(), |value| value.to_string());
     let leechers = result
         .leechers
         .map_or_else(|| "?".to_string(), |value| value.to_string());
-    let category = result.category.as_deref().unwrap_or("unknown");
+    let category = result
+        .category
+        .as_deref()
+        .map(|value| sanitize_display_text(value, 128))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let source = sanitize_display_text(&result.source_host, 253);
     let size = result
         .size_bytes
         .map_or_else(|| "unknown".to_string(), |value| human_size(Some(value)));
     format!(
         "{title} | seeders {seeders} | leechers {leechers} | {category} | {} | {size}",
-        result.source_host
+        source
     )
 }
 
@@ -150,5 +159,17 @@ mod tests {
     fn automatic_selection_chooses_the_first_ranked_result() {
         let mut chooser = TerminalChooser::new(80);
         assert_eq!(chooser.choose(&[result()], true).expect("automatic"), 0);
+    }
+
+    #[test]
+    fn formatting_does_not_emit_page_supplied_terminal_controls() {
+        let mut hostile = result();
+        hostile.name = "normal\u{1b}[2J title".to_string();
+        hostile.category = Some("Apps\u{202e}evil".to_string());
+
+        let formatted = format_result(&hostile, 80);
+
+        assert!(!formatted.contains('\u{1b}'));
+        assert!(!formatted.contains('\u{202e}'));
     }
 }

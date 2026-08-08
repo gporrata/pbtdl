@@ -4,7 +4,7 @@ use crate::browser::{
     BrowserError, BrowserFormTarget, BrowserResult, BrowserSession, RenderedDocument,
 };
 use crate::discovery::{CandidateUrl, SearchForm, ValidatedCandidate, validate_candidate_page};
-use crate::model::{MagnetUri, TorrentResult};
+use crate::model::{MagnetUri, TorrentResult, sanitize_display_text};
 use async_trait::async_trait;
 use scraper::{ElementRef, Html, Selector};
 use std::collections::HashSet;
@@ -18,6 +18,8 @@ use url::Url;
 const HARD_MAX_RESULT_ROWS: usize = 500;
 const HARD_MAX_ROW_LINKS: usize = 80;
 const HARD_MAX_TEXT_CHARACTERS: usize = 16_384;
+const HARD_MAX_TITLE_CHARACTERS: usize = 512;
+const HARD_MAX_CATEGORY_CHARACTERS: usize = 128;
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(75);
 
 #[async_trait]
@@ -229,16 +231,22 @@ impl SearchEngine {
             if remaining.is_zero() {
                 return Err(SearchFailureReason::Timeout);
             }
-            let document = tokio::time::timeout(remaining, renderer.current())
-                .await
-                .map_err(|_| SearchFailureReason::Timeout)?
-                .map_err(|error| {
-                    if matches!(error, BrowserError::Timeout { .. }) {
-                        SearchFailureReason::Timeout
-                    } else {
-                        SearchFailureReason::BrowserFailure
-                    }
-                })?;
+            let document = match tokio::time::timeout(remaining, renderer.current()).await {
+                Err(_) => return Err(SearchFailureReason::Timeout),
+                Ok(Ok(document)) => document,
+                Ok(Err(BrowserError::Operation {
+                    stage: "URL read" | "document read",
+                    ..
+                })) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    tokio::time::sleep(self.poll_interval.min(remaining)).await;
+                    continue;
+                }
+                Ok(Err(BrowserError::Timeout { .. })) => {
+                    return Err(SearchFailureReason::Timeout);
+                }
+                Ok(Err(_)) => return Err(SearchFailureReason::BrowserFailure),
+            };
             let state = recognize_result_state(&document);
             if state != ResultState::Pending {
                 return Ok(RecognizedDocument { document, state });
@@ -407,7 +415,7 @@ fn extract_name(row: ElementRef<'_>, magnet: &MagnetUri) -> Option<String> {
                 .attr("data-title")
                 .or_else(|| element.value().attr("data-name"));
             let value = attribute.map_or_else(|| element_text(element), ToString::to_string);
-            let value = collapse_whitespace(&value);
+            let value = sanitize_display_text(&value, HARD_MAX_TITLE_CHARACTERS);
             if !value.is_empty() {
                 return Some(value);
             }
@@ -417,7 +425,7 @@ fn extract_name(row: ElementRef<'_>, magnet: &MagnetUri) -> Option<String> {
         .ok()?
         .query_pairs()
         .find(|(key, _)| key == "dn")
-        .map(|(_, value)| collapse_whitespace(&value))
+        .map(|(_, value)| sanitize_display_text(&value, HARD_MAX_TITLE_CHARACTERS))
         .filter(|value| !value.is_empty())
 }
 
@@ -473,7 +481,7 @@ fn extract_category(row: ElementRef<'_>) -> Option<String> {
         if let Some(value) = row
             .select(&selector(selector_text))
             .map(element_text)
-            .map(|value| collapse_whitespace(&value))
+            .map(|value| sanitize_display_text(&value, HARD_MAX_CATEGORY_CHARACTERS))
             .find(|value| !value.is_empty())
         {
             return Some(value);
@@ -487,7 +495,7 @@ fn extract_category(row: ElementRef<'_>) -> Option<String> {
             })
         })
         .map(element_text)
-        .map(|value| collapse_whitespace(&value))
+        .map(|value| sanitize_display_text(&value, HARD_MAX_CATEGORY_CHARACTERS))
         .filter(|value| !value.is_empty())
 }
 
@@ -546,10 +554,6 @@ fn element_text(element: ElementRef<'_>) -> String {
         .take(HARD_MAX_TEXT_CHARACTERS)
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn collapse_whitespace(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn search_failure(
@@ -664,6 +668,21 @@ mod tests {
     }
 
     #[test]
+    fn hostile_titles_are_inert_and_bounded() {
+        let oversized = format!("safe\u{1b}[31m\u{202e}{}", "x".repeat(2_000));
+        let html = format!(
+            r#"<table id="searchResult"><tr><td><a class="detLink">{oversized}</a><a href="magnet:?xt=urn:btih:{HASH_ONE}">magnet</a></td></tr></table>"#
+        );
+
+        let results = parse_rendered_results(&document("https://proxy.example/search", &html));
+
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].name.contains('\u{1b}'));
+        assert!(!results[0].name.contains('\u{202e}'));
+        assert_eq!(results[0].name.chars().count(), HARD_MAX_TITLE_CHARACTERS);
+    }
+
+    #[test]
     fn parses_validated_counts_and_sizes_without_coercing_malformed_values() {
         assert_eq!(parse_count("1,234"), Some(1_234));
         assert_eq!(parse_count("unknown"), None);
@@ -721,6 +740,54 @@ mod tests {
                 method: FormMethod::Get,
             },
         }
+    }
+
+    struct TransitionRenderer {
+        calls: usize,
+        document: RenderedDocument,
+    }
+
+    #[async_trait]
+    impl SearchRenderer for TransitionRenderer {
+        async fn open(&mut self, _url: &Url) -> BrowserResult<RenderedDocument> {
+            unreachable!("wait-state test does not open a page")
+        }
+
+        async fn submit(&mut self, _form: &SearchForm, _query: &str) -> BrowserResult<()> {
+            unreachable!("wait-state test does not submit a form")
+        }
+
+        async fn current(&mut self) -> BrowserResult<RenderedDocument> {
+            self.calls += 1;
+            if self.calls == 1 {
+                Err(BrowserError::Operation {
+                    stage: "document read",
+                    message: "navigation context changed".to_string(),
+                })
+            } else {
+                Ok(self.document.clone())
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn result_wait_retries_transient_document_context_changes() {
+        let mut renderer = TransitionRenderer {
+            calls: 0,
+            document: document(
+                "https://proxy.example/search",
+                include_str!("../tests/fixtures/search/zero.html"),
+            ),
+        };
+        let engine = SearchEngine::for_test(Duration::from_secs(1), Duration::from_millis(1));
+
+        let recognized = engine
+            .wait_for_result_state(&mut renderer)
+            .await
+            .expect("retry transition");
+
+        assert_eq!(recognized.state, ResultState::Empty);
+        assert_eq!(renderer.calls, 2);
     }
 
     struct MockSearchRenderer {

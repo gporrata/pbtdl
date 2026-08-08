@@ -12,6 +12,11 @@ use std::path::{Path, PathBuf};
 use url::Url;
 
 pub const CONFIG_SCHEMA_VERSION: u32 = 1;
+const HARD_MAX_SOURCE_PAGES: usize = 8;
+const HARD_MAX_CANDIDATES: usize = 64;
+const HARD_MAX_RESULTS: usize = 500;
+const HARD_MAX_TITLE_CHARACTERS: usize = 512;
+const HARD_MAX_BROWSER_TIMEOUT_SECONDS: u64 = 300;
 pub const DEFAULT_CONFIG_TEMPLATE: &str = r#"# pbtdl configuration
 # Settings in this file override built-in defaults. Command-line options override this file.
 schema_version = 1
@@ -118,7 +123,7 @@ pub struct AppConfig {
 }
 
 impl AppConfig {
-    pub fn apply_cli(&mut self, cli: &Cli) {
+    pub fn apply_cli(&mut self, cli: &Cli) -> Result<()> {
         if let Some(output) = &cli.output {
             self.downloader.output_directory = output.clone();
         }
@@ -131,6 +136,7 @@ impl AppConfig {
         if let Some(client) = cli.client {
             self.downloader.client = client;
         }
+        self.validate()
     }
 
     fn apply_document(&mut self, document: ConfigDocument) -> Result<()> {
@@ -224,6 +230,27 @@ impl AppConfig {
             || self.browser.selector_timeout_seconds > self.browser.overall_timeout_seconds
         {
             bail!("browser navigation and selector timeouts cannot exceed the overall timeout");
+        }
+        if self.browser.overall_timeout_seconds > HARD_MAX_BROWSER_TIMEOUT_SECONDS {
+            bail!(
+                "browser overall timeout cannot exceed {HARD_MAX_BROWSER_TIMEOUT_SECONDS} seconds"
+            );
+        }
+        if self.discovery.max_source_pages.get() > HARD_MAX_SOURCE_PAGES
+            || self.discovery.max_candidates.get() > HARD_MAX_CANDIDATES
+            || self.discovery.source_pages.len() > HARD_MAX_SOURCE_PAGES
+            || self.discovery.seed_candidates.len() > HARD_MAX_CANDIDATES
+        {
+            bail!(
+                "discovery limits cannot exceed {HARD_MAX_SOURCE_PAGES} source pages or {HARD_MAX_CANDIDATES} candidates"
+            );
+        }
+        if self.search.result_limit.get() > HARD_MAX_RESULTS
+            || self.search.max_title_characters.get() > HARD_MAX_TITLE_CHARACTERS
+        {
+            bail!(
+                "search limits cannot exceed {HARD_MAX_RESULTS} results or {HARD_MAX_TITLE_CHARACTERS} title characters"
+            );
         }
         if self.downloader.seed_after_completion {
             bail!(
@@ -340,9 +367,17 @@ pub fn load_or_create(paths: ConfigPaths) -> Result<LoadedConfig> {
             paths.config_file.display()
         )
     })?;
-    let document: ConfigDocument = toml::from_str(text).with_context(|| {
-        format!(
-            "cannot parse configuration {}; the file was left unchanged",
+    let document: ConfigDocument = toml::from_str(text).map_err(|error: toml::de::Error| {
+        let line = error.span().map(|span| {
+            text.as_bytes()[..span.start.min(text.len())]
+                .iter()
+                .filter(|byte| **byte == b'\n')
+                .count()
+                + 1
+        });
+        let location = line.map_or_else(String::new, |line| format!(" near line {line}"));
+        anyhow!(
+            "cannot parse configuration {}{location}: TOML syntax or value type is invalid; the file was left unchanged",
             paths.config_file.display()
         )
     })?;
@@ -419,13 +454,13 @@ fn make_absolute(path: &Path) -> Result<PathBuf> {
 
 fn validate_entry_url(url: &Url) -> Result<()> {
     if !matches!(url.scheme(), "http" | "https") {
-        bail!("discovery entry must use HTTP or HTTPS: {url}");
+        bail!("discovery entry must use HTTP or HTTPS");
     }
     if !url.username().is_empty() || url.password().is_some() {
-        bail!("discovery entry must not contain credentials: {url}");
+        bail!("discovery entry must not contain credentials");
     }
     if url.host_str().is_none() {
-        bail!("discovery entry must contain a host: {url}");
+        bail!("discovery entry must contain a host");
     }
     Ok(())
 }
@@ -537,6 +572,20 @@ result_limit = 3
     }
 
     #[test]
+    fn malformed_configuration_does_not_echo_secret_values() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let paths = isolated_paths(temp.path());
+        fs::create_dir_all(paths.config_file.parent().expect("parent")).expect("create parent");
+        let secret = "do-not-print-this-token";
+        let original = format!("schema_version = 1\nsecret = \"{secret}\" trailing");
+        fs::write(&paths.config_file, &original).expect("write malformed config");
+
+        let error = load_or_create(paths).expect_err("malformed TOML must fail");
+
+        assert!(!format!("{error:#}").contains(secret));
+    }
+
+    #[test]
     fn unsupported_schema_reports_actionable_error_and_preserves_file() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let paths = isolated_paths(temp.path());
@@ -548,6 +597,23 @@ result_limit = 3
 
         assert!(format!("{error:#}").contains("unsupported configuration schema version 99"));
         assert_eq!(fs::read(paths.config_file).expect("read config"), original);
+    }
+
+    #[test]
+    fn rejects_configuration_and_cli_values_above_hard_caps() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let paths = isolated_paths(temp.path());
+        fs::create_dir_all(paths.config_file.parent().expect("parent")).expect("create parent");
+        fs::write(
+            &paths.config_file,
+            "schema_version = 1\n[discovery]\nmax_candidates = 65\n",
+        )
+        .expect("write oversized config");
+        assert!(load_or_create(paths).is_err());
+
+        let cli = Cli::try_parse_from(["pbtdl", "query", "--results", "501"]).expect("parse CLI");
+        let mut config = AppConfig::default();
+        assert!(config.apply_cli(&cli).is_err());
     }
 
     #[test]
@@ -596,7 +662,7 @@ result_limit = 3
         ])
         .expect("parse CLI");
 
-        loaded.config.apply_cli(&cli);
+        loaded.config.apply_cli(&cli).expect("valid CLI overrides");
 
         assert_eq!(loaded.config.search.result_limit.get(), 7);
         assert_eq!(

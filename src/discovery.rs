@@ -651,7 +651,9 @@ fn sanitized_url(url: &Url) -> String {
 
 fn reason_from_browser_error(error: &BrowserError) -> FailureReason {
     match error {
-        BrowserError::NavigationRejected(_) => FailureReason::RejectedNavigation,
+        BrowserError::NavigationRejected(_) | BrowserError::TooManyRedirects(_) => {
+            FailureReason::RejectedNavigation
+        }
         BrowserError::Timeout { .. } => FailureReason::Timeout,
         _ => FailureReason::BrowserFailure,
     }

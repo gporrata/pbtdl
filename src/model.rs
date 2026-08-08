@@ -7,6 +7,7 @@ use url::Url;
 const INFO_HASH_BYTES: usize = 20;
 const INFO_HASH_HEX_LENGTH: usize = INFO_HASH_BYTES * 2;
 const INFO_HASH_BASE32_LENGTH: usize = 32;
+const MAX_MAGNET_URI_BYTES: usize = 16 * 1024;
 
 /// A canonical lower-case hexadecimal BitTorrent v1 info hash.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -73,6 +74,9 @@ impl FromStr for MagnetUri {
     type Err = MagnetError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.len() > MAX_MAGNET_URI_BYTES {
+            return Err(MagnetError::UriTooLong);
+        }
         let url = Url::parse(value).map_err(|_| MagnetError::InvalidUri)?;
         if url.scheme() != "magnet" {
             return Err(MagnetError::UnsupportedScheme);
@@ -98,6 +102,8 @@ impl FromStr for MagnetUri {
 pub enum MagnetError {
     #[error("magnet URI is malformed")]
     InvalidUri,
+    #[error("magnet URI exceeds the supported length limit")]
+    UriTooLong,
     #[error("URI scheme must be magnet")]
     UnsupportedScheme,
     #[error("magnet URI has no supported urn:btih identity")]
@@ -127,6 +133,33 @@ impl TorrentResult {
 /// Truncate by Unicode scalar values, never by byte offsets.
 pub fn truncate_display(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
+}
+
+/// Make untrusted page text inert and bounded before displaying or storing it.
+pub fn sanitize_display_text(value: &str, max_chars: usize) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() || is_bidirectional_formatting(character) {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn is_bidirectional_formatting(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+    )
 }
 
 fn decode_hex(value: &str) -> Result<Vec<u8>, MagnetError> {
@@ -197,8 +230,30 @@ mod tests {
     }
 
     #[test]
+    fn rejects_oversized_magnet_values_before_url_parsing() {
+        let oversized = format!(
+            "magnet:?xt=urn:btih:{HEX_HASH}&dn={}",
+            "x".repeat(MAX_MAGNET_URI_BYTES)
+        );
+
+        assert_eq!(
+            MagnetUri::from_str(&oversized),
+            Err(MagnetError::UriTooLong)
+        );
+    }
+
+    #[test]
     fn truncates_unicode_on_character_boundaries() {
         assert_eq!(truncate_display("Rust 🦀 résumé", 6), "Rust 🦀");
         assert_eq!(truncate_display("短い", 20), "短い");
+    }
+
+    #[test]
+    fn sanitizes_terminal_controls_and_bidirectional_overrides() {
+        assert_eq!(
+            sanitize_display_text("safe\u{1b}[31m red\n\u{202e}hidden", 80),
+            "safe [31m red hidden"
+        );
+        assert_eq!(sanitize_display_text("résumé 🦀", 8), "résumé 🦀");
     }
 }

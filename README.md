@@ -57,7 +57,8 @@ Chromium runs headlessly by default with:
 - No access to the user's normal cookies, extensions, history, or credentials.
 - Browser-managed downloads disabled; Chromium is used only for discovery and search.
 - Pop-ups and unexpected top-level navigation rejected.
-- Bounded navigation, selector, and overall workflow timeouts.
+- Each rendered document transition intercepted before it is continued, including HTTP redirects.
+- Bounded navigation, selector, redirect, document-size, and overall browser-workflow limits.
 - Temporary browser state cleaned up after normal completion or failure.
 
 Headful mode may be exposed as a troubleshooting option, but it does not change the deterministic automation model.
@@ -114,13 +115,18 @@ Every discovery page, proxy, rendered document, result, and magnet is untrusted 
 - Permits only configured HTTP or HTTPS discovery entry points, with secure transport preferred by default.
 - Rejects navigation to local files, loopback addresses, private networks, and unsupported schemes.
 - Rechecks top-level redirects before accepting a candidate.
-- Limits candidate counts, response activity, navigation time, and extraction work.
+- Allows at most five HTTP redirect hops per rendered page and rejects every document hop that resolves to a local, private, or reserved destination.
+- Limits a rendered HTML document to 2 MiB, a query to 512 characters and 2 KiB, and extracted titles to 512 characters. Terminal controls and bidirectional formatting marks are removed from untrusted display text.
+- Limits configured and processed source pages, candidates, forms, anchors, result rows, row links, cache entries, and filesystem attribution walks.
 - Requires a well-formed `magnet:` URI with a supported `urn:btih` identifier.
 - Does not execute commands through a shell.
+- Rejects a filesystem root as an output directory and does not follow symlinks while attributing newly created files.
 - Does not reuse the user's browser profile or persist site cookies.
 - Does not automatically open downloaded content.
 
 These controls reduce exposure to malicious proxy pages but do not make an untrusted site inherently safe.
+
+Some boundaries necessarily depend on the programs `pbtdl` owns but does not implement. Chromium remains responsible for its renderer sandbox, TLS implementation, DNS-to-connection behavior, and non-document subresource requests; `pbtdl` validates document destinations, but cannot make DNS rebinding impossible. The selected torrent client remains responsible for validating torrent metadata, containing payload paths beneath its configured directory, honoring `--seed-time=0`, and enforcing filesystem permissions. `pbtdl` invokes only the documented `aria2c` contract, waits in the foreground, and terminates its owned child on interruption. Transfer duration is intentionally user-controlled rather than covered by the browser workflow deadline.
 
 ## Component boundaries
 

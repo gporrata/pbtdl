@@ -13,6 +13,10 @@ use async_trait::async_trait;
 use console::style;
 use std::path::Path;
 use std::time::Duration;
+use tokio::time::Instant as TokioInstant;
+
+const MAX_QUERY_CHARACTERS: usize = 512;
+const MAX_QUERY_BYTES: usize = 2_048;
 
 #[async_trait]
 pub trait WorkflowProvider: Send {
@@ -43,7 +47,7 @@ async fn run_with_policy(cli: Cli, policy: NavigationPolicy) -> Result<()> {
     let environment = ConfigEnvironment::current();
     let paths = ConfigPaths::resolve(cli.config.as_deref(), &environment)?;
     let mut loaded = load_or_create(paths)?;
-    loaded.config.apply_cli(&cli);
+    loaded.config.apply_cli(&cli)?;
     if loaded.created {
         eprintln!(
             "{} {}",
@@ -52,6 +56,8 @@ async fn run_with_policy(cli: Cli, policy: NavigationPolicy) -> Result<()> {
         );
     }
 
+    let workflow_deadline =
+        TokioInstant::now() + Duration::from_secs(loaded.config.browser.overall_timeout_seconds);
     eprintln!("{}", style("Starting isolated Chromium...").bold());
     let mut browser = BrowserSession::launch(&loaded.config.browser, policy)
         .await
@@ -66,7 +72,14 @@ async fn run_with_policy(cli: Cli, policy: NavigationPolicy) -> Result<()> {
     };
 
     eprintln!("{}", style("Discovering rendered proxy pages...").bold());
-    let results = collect_results(&mut provider, &cli.query).await;
+    let remaining = workflow_deadline.saturating_duration_since(TokioInstant::now());
+    let results = if remaining.is_zero() {
+        Err(anyhow!("browser workflow exceeded its overall time budget"))
+    } else {
+        tokio::time::timeout(remaining, collect_results(&mut provider, &cli.query))
+            .await
+            .unwrap_or_else(|_| Err(anyhow!("browser workflow exceeded its overall time budget")))
+    };
     let diagnostics = std::mem::take(&mut provider.diagnostics);
     drop(provider);
     let shutdown = browser.shutdown().await;
@@ -92,11 +105,24 @@ pub async fn collect_results(
     provider: &mut dyn WorkflowProvider,
     query: &str,
 ) -> Result<Vec<TorrentResult>> {
+    validate_query(query)?;
     let candidates = provider.discover().await?;
     if candidates.is_empty() {
         bail!("discovery returned no validated candidates");
     }
     provider.search(&candidates, query).await
+}
+
+fn validate_query(query: &str) -> Result<()> {
+    if query.trim().is_empty() {
+        bail!("search query cannot be empty");
+    }
+    if query.len() > MAX_QUERY_BYTES || query.chars().count() > MAX_QUERY_CHARACTERS {
+        bail!(
+            "search query exceeds the limit of {MAX_QUERY_CHARACTERS} characters or {MAX_QUERY_BYTES} UTF-8 bytes"
+        );
+    }
+    Ok(())
 }
 
 pub async fn complete_results(
@@ -107,7 +133,7 @@ pub async fn complete_results(
     downloader: &mut dyn DownloadService,
 ) -> Result<RunOutcome> {
     if results.is_empty() {
-        bail!("no torrent results were found for {:?}", cli.query);
+        bail!("no torrent results were found for the supplied query");
     }
     let limited: Vec<_> = results
         .into_iter()
@@ -252,9 +278,11 @@ impl DownloadService for ProductionDownloader {
         } else {
             println!("Downloaded files:");
             for file in outcome.new_files {
+                let path =
+                    crate::model::sanitize_display_text(&file.relative_path.to_string_lossy(), 512);
                 println!(
                     "  {} ({})",
-                    file.relative_path.display(),
+                    path,
                     crate::selection::human_size(Some(file.size_bytes))
                 );
             }
@@ -352,6 +380,25 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn invalid_queries_fail_before_discovery_without_echoing_input() {
+        for query in ["   ".to_string(), "secret".repeat(400)] {
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut provider = MockProvider {
+                candidates: vec![candidate()],
+                results: Vec::new(),
+                calls: Arc::clone(&calls),
+            };
+
+            let error = collect_results(&mut provider, &query)
+                .await
+                .expect_err("invalid query must fail");
+
+            assert!(calls.lock().expect("call lock").is_empty());
+            assert!(!error.to_string().contains(&query));
+        }
+    }
+
     struct FixedChooser(usize);
 
     impl ResultChooser for FixedChooser {
@@ -380,7 +427,7 @@ mod tests {
         let cli = Cli::try_parse_from(["pbtdl", "query", "--auto", "--dry-run", "--results", "1"])
             .expect("CLI");
         let mut config = AppConfig::default();
-        config.apply_cli(&cli);
+        config.apply_cli(&cli).expect("valid CLI overrides");
         let top = torrent("top", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 100);
         let lower = torrent("lower", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 10);
         let mut chooser = FixedChooser(0);

@@ -9,12 +9,16 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use thiserror::Error;
 use tokio::process::Command;
+use tokio::time::{Duration, timeout};
 
 const CLIENT_PRIORITY: &[ClientKind] = &[
     ClientKind::Aria2c,
     ClientKind::TransmissionCli,
     ClientKind::QbittorrentNox,
 ];
+const MAX_SNAPSHOT_ENTRIES: usize = 10_000;
+const MAX_SNAPSHOT_DEPTH: usize = 32;
+const CLIENT_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClientKind {
@@ -83,6 +87,8 @@ pub enum DownloadError {
     },
     #[error("output path is not a usable directory: {0}")]
     InvalidOutput(PathBuf),
+    #[error("output directory is too broad for safe file attribution: {0}")]
+    UnsafeOutput(PathBuf),
     #[error("cannot prepare output directory {path}: {message}")]
     OutputPreparation { path: PathBuf, message: String },
     #[error("failed to start {client}: {message}")]
@@ -91,6 +97,8 @@ pub enum DownloadError {
     NonzeroExit { client: ClientKind, status: String },
     #[error("download was interrupted")]
     Interrupted,
+    #[error("cannot safely inspect output directory: {0}")]
+    OutputInspection(&'static str),
 }
 
 pub type DownloadResult<T> = Result<T, DownloadError>;
@@ -139,7 +147,7 @@ impl LocalDownloader {
     ) -> DownloadResult<DownloadOutcome> {
         let output_directory = prepare_output_directory(output_directory)?;
         let selected = self.select_client()?;
-        let before = snapshot_files(&output_directory);
+        let before = snapshot_files(&output_directory)?;
         let args = build_arguments(selected.kind, magnet, &output_directory)?;
         let mut command = Command::new(&selected.executable);
         command
@@ -159,7 +167,20 @@ impl LocalDownloader {
                 message: error.to_string(),
             })?,
             () = &mut cancellation => {
-                let _ = child.kill().await;
+                child.start_kill().map_err(|error| DownloadError::Spawn {
+                    client: selected.kind,
+                    message: format!("failed to terminate interrupted client: {error}"),
+                })?;
+                timeout(CLIENT_CLEANUP_TIMEOUT, child.wait())
+                    .await
+                    .map_err(|_| DownloadError::Spawn {
+                        client: selected.kind,
+                        message: "timed out while reaping interrupted client".to_string(),
+                    })?
+                    .map_err(|error| DownloadError::Spawn {
+                        client: selected.kind,
+                        message: format!("failed to reap interrupted client: {error}"),
+                    })?;
                 return Err(DownloadError::Interrupted);
             }
         };
@@ -169,7 +190,7 @@ impl LocalDownloader {
                 status: status.to_string(),
             });
         }
-        let after = snapshot_files(&output_directory);
+        let after = snapshot_files(&output_directory)?;
         let mut new_files: Vec<_> = after
             .into_iter()
             .filter(|(path, _)| !before.contains_key(path))
@@ -259,11 +280,16 @@ fn prepare_output_directory(path: &Path) -> DownloadResult<PathBuf> {
             message: error.to_string(),
         })?;
     }
-    path.canonicalize()
+    let canonical = path
+        .canonicalize()
         .map_err(|error| DownloadError::OutputPreparation {
             path: path.to_path_buf(),
             message: error.to_string(),
-        })
+        })?;
+    if canonical.parent().is_none() {
+        return Err(DownloadError::UnsafeOutput(canonical));
+    }
+    Ok(canonical)
 }
 
 fn available_clients(path_entries: &[PathBuf]) -> HashMap<ClientKind, PathBuf> {
@@ -295,26 +321,32 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-fn snapshot_files(root: &Path) -> HashMap<PathBuf, u64> {
+fn snapshot_files(root: &Path) -> DownloadResult<HashMap<PathBuf, u64>> {
     let mut files = HashMap::new();
-    collect_files(root, root, &mut files, &mut HashSet::new());
-    files
+    collect_files(root, root, 0, &mut files, &mut HashSet::new())?;
+    Ok(files)
 }
 
 fn collect_files(
     root: &Path,
     directory: &Path,
+    depth: usize,
     files: &mut HashMap<PathBuf, u64>,
     visited: &mut HashSet<PathBuf>,
-) {
+) -> DownloadResult<()> {
+    if depth > MAX_SNAPSHOT_DEPTH {
+        return Err(DownloadError::OutputInspection(
+            "directory nesting exceeds the attribution limit",
+        ));
+    }
     let Ok(canonical) = directory.canonicalize() else {
-        return;
+        return Ok(());
     };
     if !visited.insert(canonical) {
-        return;
+        return Ok(());
     }
     let Ok(entries) = std::fs::read_dir(directory) else {
-        return;
+        return Ok(());
     };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -325,13 +357,19 @@ fn collect_files(
             continue;
         }
         if file_type.is_dir() {
-            collect_files(root, &path, files, visited);
+            collect_files(root, &path, depth + 1, files, visited)?;
         } else if file_type.is_file() {
             if let (Ok(relative), Ok(metadata)) = (path.strip_prefix(root), entry.metadata()) {
+                if files.len() >= MAX_SNAPSHOT_ENTRIES {
+                    return Err(DownloadError::OutputInspection(
+                        "file count exceeds the attribution limit",
+                    ));
+                }
                 files.insert(relative.to_path_buf(), metadata.len());
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -509,6 +547,38 @@ printf 'done' > "$output/completed.bin""#,
                 .await,
             Err(DownloadError::NonzeroExit { .. })
         ));
+    }
+
+    #[test]
+    fn rejects_filesystem_root_and_bounded_snapshot_overflow() {
+        assert!(matches!(
+            prepare_output_directory(Path::new("/")),
+            Err(DownloadError::UnsafeOutput(_))
+        ));
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let mut nested = temp.path().to_path_buf();
+        for _ in 0..=MAX_SNAPSHOT_DEPTH {
+            nested.push("nested");
+            fs::create_dir(&nested).expect("create nested directory");
+        }
+        assert!(matches!(
+            snapshot_files(temp.path()),
+            Err(DownloadError::OutputInspection(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshots_do_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let outside = tempfile::tempdir().expect("outside directory");
+        fs::write(outside.path().join("outside.bin"), b"outside").expect("outside file");
+        symlink(outside.path(), temp.path().join("linked")).expect("create symlink");
+
+        assert!(snapshot_files(temp.path()).expect("snapshot").is_empty());
     }
 
     #[tokio::test]

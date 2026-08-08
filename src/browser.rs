@@ -1,9 +1,14 @@
 //! Isolated Chromium ownership and bounded rendered-page navigation.
 
 use crate::config::BrowserConfig as AppBrowserConfig;
+use crate::model::sanitize_display_text;
 use chromiumoxide::cdp::browser_protocol::browser::{
     SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
 };
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    ContinueRequestParams, EventRequestPaused, FailRequestParams,
+};
+use chromiumoxide::cdp::browser_protocol::network::{ErrorReason, ResourceType};
 use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures::StreamExt;
@@ -15,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tempfile::TempDir;
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 use url::{Host, Url};
@@ -27,6 +33,9 @@ const COMMON_BROWSER_PATHS: &[&str] = &[
     "/snap/bin/chromium",
 ];
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_REDIRECTS: usize = 5;
+const MAX_RENDERED_DOCUMENT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_EXTERNAL_ERROR_CHARACTERS: usize = 240;
 
 #[derive(Debug, Error)]
 pub enum BrowserError {
@@ -49,6 +58,10 @@ pub enum BrowserError {
     NavigationRejected(String),
     #[error("page opened an unexpected top-level window")]
     UnexpectedWindow,
+    #[error("navigation rejected after more than {0} redirects")]
+    TooManyRedirects(usize),
+    #[error("rendered document exceeded the {0}-byte extraction limit")]
+    DocumentTooLarge(usize),
     #[error("browser has no active page")]
     NoActivePage,
 }
@@ -155,6 +168,8 @@ pub struct BrowserSession {
     handler_task: Option<JoinHandle<Result<(), String>>>,
     profile: Option<TempDir>,
     page: Option<Page>,
+    interceptor_task: Option<JoinHandle<()>>,
+    interceptor_errors: Option<mpsc::UnboundedReceiver<BrowserError>>,
     ignored_targets: HashSet<TargetId>,
     navigation_timeout: Duration,
     selector_timeout: Duration,
@@ -171,7 +186,7 @@ impl BrowserSession {
         let profile = tempfile::Builder::new()
             .prefix("pbtdl-chromium-")
             .tempdir()
-            .map_err(|error| BrowserError::Launch(error.to_string()))?;
+            .map_err(|error| BrowserError::Launch(safe_external_message(&error.to_string())))?;
         let navigation_timeout = Duration::from_secs(settings.navigation_timeout_seconds);
         let overall_timeout = Duration::from_secs(settings.overall_timeout_seconds);
         let selector_timeout = Duration::from_secs(settings.selector_timeout_seconds);
@@ -186,7 +201,7 @@ impl BrowserSession {
         let (mut browser, mut handler) = timeout(overall_timeout, Browser::launch(chromium_config))
             .await
             .map_err(|_| BrowserError::Timeout { stage: "launch" })?
-            .map_err(|error| BrowserError::Launch(error.to_string()))?;
+            .map_err(|error| BrowserError::Launch(safe_external_message(&error.to_string())))?;
 
         let handler_task = tokio::spawn(async move {
             while let Some(event) = handler.next().await {
@@ -205,7 +220,7 @@ impl BrowserSession {
             handler_task.abort();
             return Err(BrowserError::Operation {
                 stage: "download policy",
-                message: error.to_string(),
+                message: safe_external_message(&error.to_string()),
             });
         }
 
@@ -224,6 +239,8 @@ impl BrowserSession {
             handler_task: Some(handler_task),
             profile: Some(profile),
             page: None,
+            interceptor_task: None,
+            interceptor_errors: None,
             ignored_targets,
             navigation_timeout,
             selector_timeout,
@@ -250,12 +267,25 @@ impl BrowserSession {
         )
         .await
         .map_err(|error| map_cdp_error("page creation", error))?;
-        if let Err(error) = timed(operation_timeout, "navigation", page.goto(url.as_str())).await {
+        if let Err(error) = self
+            .start_document_interceptor(page.clone(), operation_timeout)
+            .await
+        {
             let _ = page.close().await;
-            return Err(map_cdp_error("navigation", error));
+            return Err(error);
+        }
+        if let Err(error) = timed(operation_timeout, "navigation", page.goto(url.as_str())).await {
+            let intercept_error = self.take_interceptor_error();
+            self.stop_document_interceptor();
+            let _ = page.close().await;
+            return Err(intercept_error.unwrap_or_else(|| map_cdp_error("navigation", error)));
         }
 
         self.page = Some(page);
+        if let Err(error) = self.check_interceptor_error() {
+            self.close_active_page().await;
+            return Err(error);
+        }
         if let Err(error) = self.reject_unexpected_pages().await {
             self.close_active_page().await;
             return Err(error);
@@ -272,10 +302,12 @@ impl BrowserSession {
     }
 
     pub async fn current_document(&mut self) -> BrowserResult<RenderedDocument> {
+        self.check_interceptor_error()?;
         let url = self.current_url().await?;
         let operation_timeout = self.operation_timeout("document read")?;
         self.policy.validate(&url, operation_timeout).await?;
         let html = self.current_content().await?;
+        self.check_interceptor_error()?;
         self.reject_unexpected_pages().await?;
         Ok(RenderedDocument { url, html })
     }
@@ -289,17 +321,17 @@ impl BrowserSession {
         let page = self.page.as_ref().ok_or(BrowserError::NoActivePage)?;
         let query = serde_json::to_string(query).map_err(|error| BrowserError::Operation {
             stage: "form submission",
-            message: error.to_string(),
+            message: safe_external_message(&error.to_string()),
         })?;
         let input_name =
             serde_json::to_string(&target.input_name).map_err(|error| BrowserError::Operation {
                 stage: "form submission",
-                message: error.to_string(),
+                message: safe_external_message(&error.to_string()),
             })?;
         let input_id =
             serde_json::to_string(&target.input_id).map_err(|error| BrowserError::Operation {
                 stage: "form submission",
-                message: error.to_string(),
+                message: safe_external_message(&error.to_string()),
             })?;
         let script = format!(
             r#"(() => {{
@@ -338,7 +370,7 @@ impl BrowserSession {
                 .into_value()
                 .map_err(|error| BrowserError::Operation {
                     stage: "form submission",
-                    message: error.to_string(),
+                    message: safe_external_message(&error.to_string()),
                 })?;
         if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
             return Err(BrowserError::Operation {
@@ -367,7 +399,7 @@ impl BrowserSession {
                     Ok(Err(error)) => {
                         first_error = Some(BrowserError::Operation {
                             stage: "shutdown",
-                            message: error.to_string(),
+                            message: safe_external_message(&error.to_string()),
                         });
                     }
                     Err(_) => {
@@ -378,7 +410,7 @@ impl BrowserSession {
                 Ok(Err(error)) => {
                     first_error = Some(BrowserError::Operation {
                         stage: "shutdown",
-                        message: error.to_string(),
+                        message: safe_external_message(&error.to_string()),
                     });
                     let _ = browser.kill().await;
                 }
@@ -414,9 +446,10 @@ impl BrowserSession {
     async fn current_content(&self) -> BrowserResult<String> {
         let page = self.page.as_ref().ok_or(BrowserError::NoActivePage)?;
         let duration = self.operation_timeout("document read")?;
-        timed(duration, "document read", page.content())
+        let html = timed(duration, "document read", page.content())
             .await
-            .map_err(|error| map_cdp_error("document read", error))
+            .map_err(|error| map_cdp_error("document read", error))?;
+        enforce_document_limit(html)
     }
 
     async fn reject_unexpected_pages(&mut self) -> BrowserResult<()> {
@@ -440,14 +473,18 @@ impl BrowserSession {
         let mut unexpected = false;
         for page in pages {
             if page.target_id() != &active_id {
+                let page_url = timed(duration, "window check", page.url())
+                    .await
+                    .ok()
+                    .flatten();
                 let is_browser_created_blank = self.ignored_targets.contains(page.target_id())
                     || (page.opener_id().is_none()
                         && matches!(
-                            page.url().await.ok().flatten().as_deref(),
+                            page_url.as_deref(),
                             Some("about:blank") | Some("chrome://newtab/")
                         ));
                 unexpected |= !is_browser_created_blank;
-                let _ = page.close().await;
+                let _ = timeout(CLEANUP_TIMEOUT, page.close()).await;
             }
         }
         if unexpected {
@@ -458,10 +495,95 @@ impl BrowserSession {
     }
 
     async fn close_active_page(&mut self) {
+        self.stop_document_interceptor();
         if let Some(page) = self.page.take() {
             self.ignored_targets.insert(page.target_id().clone());
             let _ = timeout(CLEANUP_TIMEOUT, page.close()).await;
         }
+    }
+
+    fn stop_document_interceptor(&mut self) {
+        if let Some(task) = self.interceptor_task.take() {
+            task.abort();
+        }
+        self.interceptor_errors.take();
+    }
+
+    async fn start_document_interceptor(
+        &mut self,
+        page: Page,
+        validation_timeout: Duration,
+    ) -> BrowserResult<()> {
+        let mut events = timed(
+            validation_timeout,
+            "navigation policy initialization",
+            page.event_listener::<EventRequestPaused>(),
+        )
+        .await
+        .map_err(|error| map_cdp_error("navigation policy initialization", error))?;
+        let (errors_tx, errors_rx) = mpsc::unbounded_channel();
+        let policy = self.policy;
+        let interceptor_page = page;
+        let task = tokio::spawn(async move {
+            let mut redirect_budget = RedirectBudget::new(MAX_REDIRECTS);
+            while let Some(event) = events.next().await {
+                if event.response_status_code.is_some() {
+                    if interceptor_page
+                        .execute(ContinueRequestParams::new(event.request_id.clone()))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
+
+                let validation = if event.resource_type == ResourceType::Document {
+                    validate_document_request(
+                        &policy,
+                        &mut redirect_budget,
+                        &event,
+                        validation_timeout,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = validation {
+                    let _ = interceptor_page
+                        .execute(FailRequestParams::new(
+                            event.request_id.clone(),
+                            ErrorReason::BlockedByClient,
+                        ))
+                        .await;
+                    let _ = errors_tx.send(error);
+                    break;
+                }
+                if interceptor_page
+                    .execute(ContinueRequestParams::new(event.request_id.clone()))
+                    .await
+                    .is_err()
+                {
+                    // Chromium can cancel a request between emitting the pause event and
+                    // accepting the continuation. A required document failure is surfaced by
+                    // the navigation/read operation; canceled subresources are non-fatal.
+                    continue;
+                }
+            }
+        });
+        self.interceptor_task = Some(task);
+        self.interceptor_errors = Some(errors_rx);
+        Ok(())
+    }
+
+    fn check_interceptor_error(&mut self) -> BrowserResult<()> {
+        self.take_interceptor_error().map_or(Ok(()), Err)
+    }
+
+    fn take_interceptor_error(&mut self) -> Option<BrowserError> {
+        self.interceptor_errors
+            .as_mut()
+            .and_then(|errors| errors.try_recv().ok())
     }
 
     async fn capture_idle_targets(&mut self) -> BrowserResult<()> {
@@ -475,7 +597,7 @@ impl BrowserSession {
             .map_err(|error| map_cdp_error("window initialization", error))?;
         for page in pages {
             self.ignored_targets.insert(page.target_id().clone());
-            let _ = page.close().await;
+            let _ = timeout(CLEANUP_TIMEOUT, page.close()).await;
         }
         Ok(())
     }
@@ -513,6 +635,9 @@ impl BrowserSession {
 
 impl Drop for BrowserSession {
     fn drop(&mut self) {
+        if let Some(task) = self.interceptor_task.take() {
+            task.abort();
+        }
         let Some(mut browser) = self.browser.take() else {
             return;
         };
@@ -522,7 +647,7 @@ impl Drop for BrowserSession {
         let profile = self.profile.take();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                let _ = browser.kill().await;
+                let _ = timeout(CLEANUP_TIMEOUT, browser.kill()).await;
                 drop(profile);
             });
         } else {
@@ -548,6 +673,7 @@ impl BrowserLaunchPlan {
             .incognito()
             .respect_https_errors()
             .disable_cache()
+            .enable_request_intercept()
             .launch_timeout(self.launch_timeout)
             .request_timeout(self.launch_timeout)
             .args([
@@ -562,7 +688,9 @@ impl BrowserLaunchPlan {
         } else {
             builder.with_head()
         };
-        builder.build().map_err(BrowserError::Launch)
+        builder
+            .build()
+            .map_err(|error| BrowserError::Launch(safe_external_message(&error)))
     }
 }
 
@@ -687,9 +815,68 @@ fn map_cdp_error(
         TimedError::Timeout(stage) => BrowserError::Timeout { stage },
         TimedError::Inner(error) => BrowserError::Operation {
             stage,
-            message: error.to_string(),
+            message: safe_external_message(&error.to_string()),
         },
     }
+}
+
+#[derive(Debug)]
+struct RedirectBudget {
+    limit: usize,
+    redirects: usize,
+}
+
+impl RedirectBudget {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            redirects: 0,
+        }
+    }
+
+    fn observe(&mut self, redirected: bool) -> BrowserResult<()> {
+        if redirected {
+            self.redirects += 1;
+        }
+        if self.redirects > self.limit {
+            Err(BrowserError::TooManyRedirects(self.limit))
+        } else {
+            Ok(())
+        }
+    }
+}
+
+async fn validate_document_request(
+    policy: &NavigationPolicy,
+    redirect_budget: &mut RedirectBudget,
+    event: &EventRequestPaused,
+    validation_timeout: Duration,
+) -> BrowserResult<()> {
+    redirect_budget.observe(event.redirected_request_id.is_some())?;
+    let url = Url::parse(&event.request.url).map_err(|_| {
+        BrowserError::NavigationRejected("browser requested a malformed document URL".to_string())
+    })?;
+    policy.validate(&url, validation_timeout).await
+}
+
+fn enforce_document_limit(html: String) -> BrowserResult<String> {
+    if html.len() > MAX_RENDERED_DOCUMENT_BYTES {
+        Err(BrowserError::DocumentTooLarge(MAX_RENDERED_DOCUMENT_BYTES))
+    } else {
+        Ok(html)
+    }
+}
+
+fn safe_external_message(value: &str) -> String {
+    let sanitized = sanitize_display_text(value, MAX_EXTERNAL_ERROR_CHARACTERS + 1);
+    let mut output: String = sanitized
+        .chars()
+        .take(MAX_EXTERNAL_ERROR_CHARACTERS)
+        .collect();
+    if sanitized.chars().count() > MAX_EXTERNAL_ERROR_CHARACTERS {
+        output.push('…');
+    }
+    output
 }
 
 #[cfg(test)]
@@ -778,6 +965,34 @@ mod tests {
         assert!(!profile_path.exists());
     }
 
+    #[test]
+    fn redirect_and_document_budgets_are_enforced() {
+        let mut budget = RedirectBudget::new(2);
+        assert!(budget.observe(false).is_ok());
+        assert!(budget.observe(true).is_ok());
+        assert!(budget.observe(true).is_ok());
+        assert!(matches!(
+            budget.observe(true),
+            Err(BrowserError::TooManyRedirects(2))
+        ));
+
+        assert!(enforce_document_limit("x".repeat(MAX_RENDERED_DOCUMENT_BYTES)).is_ok());
+        assert!(matches!(
+            enforce_document_limit("x".repeat(MAX_RENDERED_DOCUMENT_BYTES + 1)),
+            Err(BrowserError::DocumentTooLarge(MAX_RENDERED_DOCUMENT_BYTES))
+        ));
+    }
+
+    #[test]
+    fn external_browser_errors_are_single_line_and_bounded() {
+        let hostile = format!("failure\nsecret\u{1b}[31m{}", "x".repeat(500));
+        let message = safe_external_message(&hostile);
+
+        assert!(!message.contains('\n'));
+        assert!(!message.contains('\u{1b}'));
+        assert!(message.chars().count() <= MAX_EXTERNAL_ERROR_CHARACTERS + 1);
+    }
+
     #[tokio::test]
     async fn production_policy_rejects_local_and_unsupported_destinations() {
         let policy = NavigationPolicy::production();
@@ -844,6 +1059,121 @@ mod tests {
         assert_eq!(rendered.url, url);
         server.await.expect("server task").expect("server response");
         session.shutdown().await.expect("shutdown browser");
+        assert!(!profile_path.exists());
+    }
+
+    async fn serve_redirects(redirects: usize, final_body: String) -> (Url, JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind local server");
+        let address = listener.local_addr().expect("server address");
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut request = [0_u8; 2048];
+                let count = stream.read(&mut request).await.unwrap_or(0);
+                let path = String::from_utf8_lossy(&request[..count])
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("/0")
+                    .trim_start_matches('/')
+                    .parse::<usize>()
+                    .unwrap_or(0);
+                let response = if path < redirects {
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        path + 1
+                    )
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        final_body.len(),
+                        final_body
+                    )
+                };
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (
+            Url::parse(&format!("http://{address}/0")).expect("local URL"),
+            task,
+        )
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a system Chrome/Chromium executable"]
+    async fn local_browser_enforces_redirect_and_rendered_document_limits() {
+        if locate_browser(None).is_err() {
+            eprintln!("skipping: no system Chrome or Chromium executable");
+            return;
+        }
+        let settings = AppBrowserConfig {
+            navigation_timeout_seconds: 10,
+            overall_timeout_seconds: 30,
+            ..AppBrowserConfig::default()
+        };
+        let mut session = BrowserSession::launch(&settings, NavigationPolicy::local_test_pages())
+            .await
+            .expect("launch browser");
+
+        let (allowed_url, allowed_server) =
+            serve_redirects(MAX_REDIRECTS, "<title>allowed</title>".to_string()).await;
+        session
+            .navigate(&allowed_url)
+            .await
+            .expect("redirect limit is inclusive");
+        allowed_server.abort();
+
+        let (blocked_url, blocked_server) =
+            serve_redirects(MAX_REDIRECTS + 1, "<title>blocked</title>".to_string()).await;
+        assert!(matches!(
+            session.navigate(&blocked_url).await,
+            Err(BrowserError::TooManyRedirects(MAX_REDIRECTS))
+        ));
+        blocked_server.abort();
+
+        let (large_url, large_server) = serve_redirects(
+            0,
+            format!(
+                "<body>{}</body>",
+                "x".repeat(MAX_RENDERED_DOCUMENT_BYTES + 1)
+            ),
+        )
+        .await;
+        assert!(matches!(
+            session.navigate(&large_url).await,
+            Err(BrowserError::DocumentTooLarge(MAX_RENDERED_DOCUMENT_BYTES))
+        ));
+        large_server.abort();
+        session.shutdown().await.expect("shutdown browser");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a system Chrome/Chromium executable"]
+    async fn dropped_browser_session_removes_owned_profile() {
+        if locate_browser(None).is_err() {
+            eprintln!("skipping: no system Chrome or Chromium executable");
+            return;
+        }
+        let settings = AppBrowserConfig {
+            navigation_timeout_seconds: 10,
+            overall_timeout_seconds: 30,
+            ..AppBrowserConfig::default()
+        };
+        let session = BrowserSession::launch(&settings, NavigationPolicy::local_test_pages())
+            .await
+            .expect("launch browser");
+        let profile_path = session.profile_path().expect("owned profile").to_path_buf();
+
+        drop(session);
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        while profile_path.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
         assert!(!profile_path.exists());
     }
 
