@@ -1,3 +1,4 @@
+use crate::config::DownloaderPreference;
 use clap::Parser;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -29,6 +30,10 @@ pub struct Cli {
     #[arg(long)]
     pub headful: bool,
 
+    /// Select a local torrent client instead of automatic detection.
+    #[arg(long, value_enum)]
+    pub client: Option<DownloaderPreference>,
+
     /// Use this configuration file instead of the XDG default.
     #[arg(long, value_name = "FILE")]
     pub config: Option<PathBuf>,
@@ -51,6 +56,8 @@ mod tests {
             "--auto",
             "--dry-run",
             "--headful",
+            "--client",
+            "aria2c",
             "--config",
             "/tmp/pbtdl.toml",
         ])
@@ -62,6 +69,7 @@ mod tests {
         assert!(cli.auto);
         assert!(cli.dry_run);
         assert!(cli.headful);
+        assert_eq!(cli.client, Some(DownloaderPreference::Aria2c));
         assert_eq!(cli.config, Some(PathBuf::from("/tmp/pbtdl.toml")));
     }
 

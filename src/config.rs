@@ -2,6 +2,7 @@
 
 use crate::cli::Cli;
 use anyhow::{Context, Result, anyhow, bail};
+use clap::ValueEnum;
 use serde::Deserialize;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, OpenOptions};
@@ -126,6 +127,9 @@ impl AppConfig {
         }
         if cli.headful {
             self.browser.headless = false;
+        }
+        if let Some(client) = cli.client {
+            self.downloader.client = client;
         }
     }
 
@@ -293,7 +297,7 @@ impl Default for SearchConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum DownloaderPreference {
     Auto,

@@ -4,6 +4,7 @@ use crate::browser::{BrowserSession, NavigationPolicy};
 use crate::cli::Cli;
 use crate::config::{AppConfig, ConfigEnvironment, ConfigPaths, DiscoveryConfig, load_or_create};
 use crate::discovery::{DiscoveryEngine, DiscoveryError, ValidatedCandidate};
+use crate::downloader::LocalDownloader;
 use crate::model::{MagnetUri, TorrentResult};
 use crate::search::{SearchEngine, SearchError};
 use crate::selection::{ResultChooser, TerminalChooser, format_result};
@@ -76,7 +77,9 @@ async fn run_with_policy(cli: Cli, policy: NavigationPolicy) -> Result<()> {
     }
 
     let mut chooser = TerminalChooser::new(loaded.config.search.max_title_characters.get());
-    let mut downloader = UnavailableDownloader;
+    let mut downloader = ProductionDownloader(LocalDownloader::from_current_path(
+        loaded.config.downloader.client,
+    ));
     let outcome =
         complete_results(results, &loaded.config, &cli, &mut chooser, &mut downloader).await?;
     if outcome.downloaded {
@@ -238,12 +241,25 @@ fn search_error(error: SearchError) -> anyhow::Error {
     }
 }
 
-struct UnavailableDownloader;
+struct ProductionDownloader(LocalDownloader);
 
 #[async_trait]
-impl DownloadService for UnavailableDownloader {
-    async fn download(&mut self, _magnet: &MagnetUri, _output_directory: &Path) -> Result<()> {
-        bail!("local downloader adapters are not available yet; rerun with --dry-run")
+impl DownloadService for ProductionDownloader {
+    async fn download(&mut self, magnet: &MagnetUri, output_directory: &Path) -> Result<()> {
+        let outcome = self.0.download(magnet, output_directory).await?;
+        if outcome.new_files.is_empty() {
+            println!("Downloader completed; no newly created files could be attributed.");
+        } else {
+            println!("Downloaded files:");
+            for file in outcome.new_files {
+                println!(
+                    "  {} ({})",
+                    file.relative_path.display(),
+                    crate::selection::human_size(Some(file.size_bytes))
+                );
+            }
+        }
+        Ok(())
     }
 }
 

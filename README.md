@@ -97,13 +97,11 @@ Seeder count is the initial default ordering because it matches the behavior of 
 
 ## Downloader decisions
 
-The initial release delegates BitTorrent transfers to local executables, following the `master_old` approach. It does not use a search-index API and does not need a remote download service. Supported adapters are:
+The initial release delegates BitTorrent transfers to local executables, following the `master_old` approach. It does not use a search-index API and does not need a remote download service. The supported foreground adapter is:
 
 - `aria2c`, preferred when available.
-- `transmission-cli`.
-- `qbittorrent-nox` when it can provide the required foreground behavior.
 
-Automatic client detection follows that order unless the user selects a client explicitly. Each client is invoked directly with an argument array, never through a shell command. The selected magnet is therefore treated as data rather than executable command text.
+`transmission-cli` does not expose a reliable stop-seeding-on-completion option, and `qbittorrent-nox` is a long-running service rather than a foreground per-download process. They are recognized for actionable diagnostics but are not advertised as supported in this release. Automatic client detection therefore selects `aria2c`; an explicit incompatible selection fails before launch. Each client is invoked directly with an argument array, never through a shell command. The selected magnet is therefore treated as data rather than executable command text.
 
 The default workflow is foreground-oriented: `pbtdl` waits for the downloader outcome, propagates failures, and reports what completed. Clients must implement consistent download and no-post-completion-seeding semantics to be advertised as supported. A future enqueue mode may use a local daemon interface, but local downloader APIs are not required for the first release.
 
