@@ -20,6 +20,10 @@ pub struct Cli {
     /// Select the highest-ranked result without prompting.
     #[arg(long)]
     pub auto: bool,
+
+    /// Use this configuration file instead of the XDG default.
+    #[arg(long, value_name = "FILE")]
+    pub config: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -37,6 +41,8 @@ mod tests {
             "--results",
             "5",
             "--auto",
+            "--config",
+            "/tmp/pbtdl.toml",
         ])
         .expect("CLI should parse");
 
@@ -44,6 +50,7 @@ mod tests {
         assert_eq!(cli.output, Some(PathBuf::from("/tmp/downloads")));
         assert_eq!(cli.results.map(NonZeroUsize::get), Some(5));
         assert!(cli.auto);
+        assert_eq!(cli.config, Some(PathBuf::from("/tmp/pbtdl.toml")));
     }
 
     #[test]
