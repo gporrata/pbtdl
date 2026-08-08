@@ -1,0 +1,23 @@
+/target/
+
+# Browser/runtime state
+/.chromium-profile-*/
+/browser-profiles/
+/.cache/
+/pbtdl-cache/
+
+# Test, profiling, and coverage output
+/coverage/
+*.profraw
+flamegraph.svg
+
+# Logs and downloaded content
+*.log
+/downloads/
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo

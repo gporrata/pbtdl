@@ -1,0 +1,3 @@
+- a rust app to find a piratebay proxy site, then a piratebay site, search that site for torrents, and run a local ubuntu client to download that torrent
+- the torrent would only be for legally allowed downloadable content
+- the rust app would use the best agentic headless browser for doing so
