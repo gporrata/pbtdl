@@ -297,7 +297,10 @@ mod tests {
     use crate::discovery::{FormMethod, QueryInput, normalize_candidate};
     use crate::model::MagnetUri;
     use clap::Parser;
+    use std::fs;
     use std::io;
+    use std::num::NonZeroUsize;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::str::FromStr;
     use std::sync::{Arc, Mutex};
@@ -509,6 +512,181 @@ mod tests {
             url::Url::parse(&format!("http://{address}/")).expect("local URL"),
             task,
         )
+    }
+
+    fn write_fake_downloader(directory: &Path, marker: &Path) {
+        let executable = directory.join("aria2c");
+        let script = format!(
+            r#"#!/bin/sh
+set -eu
+printf 'invoked' > '{}'
+output=''
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = '--dir' ]; then output="$2"; shift 2; else shift; fi
+done
+printf 'local fixture' > "$output/legal-fixture.bin"
+"#,
+            marker.display()
+        );
+        fs::write(&executable, script).expect("write fake downloader");
+        let mut permissions = fs::metadata(&executable)
+            .expect("fake downloader metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&executable, permissions).expect("make fake downloader executable");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a system Chrome/Chromium executable"]
+    async fn complete_local_workflow_uses_fallback_and_fake_downloader() {
+        if crate::browser::locate_browser(None).is_err() {
+            eprintln!("skipping: no system Chrome or Chromium executable");
+            return;
+        }
+
+        let (blocked_url, blocked_server) = serve(Arc::new(|_| {
+            include_str!("../tests/fixtures/discovery/blocked.html").to_string()
+        }))
+        .await;
+        let (malformed_url, malformed_server) = serve(Arc::new(|_| {
+            include_str!("../tests/fixtures/discovery/deceptive.html").to_string()
+        }))
+        .await;
+        let working_handler: Arc<dyn Fn(&str) -> String + Send + Sync> = Arc::new(|path| {
+            if path.starts_with("/search?") {
+                include_str!("../tests/fixtures/search/classic.html").to_string()
+            } else {
+                include_str!("../tests/fixtures/discovery/valid_candidate.html").to_string()
+            }
+        });
+        let (working_url, working_server) = serve(working_handler).await;
+        let source_body = format!(
+            "<!doctype html><a href=\"{blocked_url}\">TPB proxy blocked</a><a href=\"{malformed_url}\">TPB proxy malformed</a><a href=\"{working_url}\">TPB proxy working</a>"
+        );
+        let (source_url, source_server) = serve(Arc::new(move |_| source_body.clone())).await;
+
+        let temp = tempfile::tempdir().expect("temporary workflow directory");
+        let paths = ConfigPaths {
+            config_file: temp.path().join("xdg/config/pbtdl/pbtdl.toml"),
+            cache_dir: temp.path().join("xdg/cache/pbtdl"),
+        };
+        let mut loaded = load_or_create(paths.clone()).expect("create default configuration");
+        assert!(loaded.created);
+        assert_eq!(loaded.paths, paths);
+        assert_eq!(
+            fs::read_to_string(&loaded.paths.config_file).expect("read generated configuration"),
+            crate::config::DEFAULT_CONFIG_TEMPLATE
+        );
+        loaded.config.discovery.source_pages = vec![source_url];
+        loaded.config.discovery.seed_candidates.clear();
+        loaded.config.discovery.max_source_pages = NonZeroUsize::new(1).expect("nonzero");
+        loaded.config.discovery.max_candidates = NonZeroUsize::new(8).expect("nonzero");
+        loaded.config.browser.navigation_timeout_seconds = 10;
+        loaded.config.browser.selector_timeout_seconds = 10;
+        loaded.config.browser.overall_timeout_seconds = 45;
+
+        let policy = NavigationPolicy::local_test_pages();
+        let mut browser = BrowserSession::launch(&loaded.config.browser, policy)
+            .await
+            .expect("launch isolated browser");
+        let profile = browser.profile_path().expect("owned profile").to_path_buf();
+        let mut provider = BrowserWorkflowProvider {
+            browser: &mut browser,
+            discovery_engine: DiscoveryEngine::with_policy(&loaded.paths.cache_dir, policy),
+            discovery_settings: loaded.config.discovery.clone(),
+            search_engine: SearchEngine::new(Duration::from_secs(10)),
+            diagnostics: Vec::new(),
+        };
+
+        let results = collect_results(&mut provider, "legal test image")
+            .await
+            .expect("discover fallback and search rendered results");
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].name, "Ubuntu 🐧 résumé");
+        assert!(
+            provider
+                .diagnostics
+                .iter()
+                .any(|message| message.contains("skipped 2"))
+        );
+        drop(provider);
+        browser.shutdown().await.expect("shutdown browser");
+        assert!(!profile.exists());
+
+        let fake_bin = temp.path().join("fake-bin");
+        let output = temp.path().join("downloads");
+        let marker = temp.path().join("fake-client-invoked");
+        fs::create_dir(&fake_bin).expect("create fake binary directory");
+        write_fake_downloader(&fake_bin, &marker);
+        let local_downloader = || {
+            ProductionDownloader(LocalDownloader::with_path_entries(
+                crate::config::DownloaderPreference::Aria2c,
+                vec![fake_bin.clone()],
+            ))
+        };
+        let output_text = output.to_str().expect("UTF-8 output path");
+        let dry_cli = Cli::try_parse_from([
+            "pbtdl",
+            "legal test image",
+            "--auto",
+            "--dry-run",
+            "--output",
+            output_text,
+        ])
+        .expect("dry-run CLI");
+        loaded
+            .config
+            .apply_cli(&dry_cli)
+            .expect("apply dry-run CLI");
+        let mut dry_chooser = TerminalChooser::new(80);
+        let mut dry_downloader = local_downloader();
+        let dry_outcome = complete_results(
+            results.clone(),
+            &loaded.config,
+            &dry_cli,
+            &mut dry_chooser,
+            &mut dry_downloader,
+        )
+        .await
+        .expect("complete dry run");
+        assert!(!dry_outcome.downloaded);
+        assert!(!marker.exists());
+
+        let download_cli = Cli::try_parse_from([
+            "pbtdl",
+            "legal test image",
+            "--auto",
+            "--output",
+            output_text,
+        ])
+        .expect("download CLI");
+        loaded
+            .config
+            .apply_cli(&download_cli)
+            .expect("apply download CLI");
+        let mut chooser = TerminalChooser::new(80);
+        let mut downloader = local_downloader();
+        let outcome = complete_results(
+            results,
+            &loaded.config,
+            &download_cli,
+            &mut chooser,
+            &mut downloader,
+        )
+        .await
+        .expect("invoke fake downloader");
+        assert!(outcome.downloaded);
+        assert!(marker.exists());
+        assert_eq!(
+            fs::read(output.join("legal-fixture.bin")).expect("fake downloaded file"),
+            b"local fixture"
+        );
+
+        source_server.abort();
+        blocked_server.abort();
+        malformed_server.abort();
+        working_server.abort();
     }
 
     #[tokio::test]

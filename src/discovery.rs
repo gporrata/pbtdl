@@ -1177,4 +1177,36 @@ mod tests {
         blocked_server.abort();
         valid_server.abort();
     }
+
+    #[tokio::test]
+    #[ignore = "opt-in live rendered discovery diagnostic; never searches or downloads"]
+    async fn live_discovery_diagnostic_only() {
+        if std::env::var_os("PBTDL_LIVE_DISCOVERY").as_deref() != Some(std::ffi::OsStr::new("1")) {
+            eprintln!("skipping: set PBTDL_LIVE_DISCOVERY=1 to enable the live diagnostic");
+            return;
+        }
+        if crate::browser::locate_browser(None).is_err() {
+            eprintln!("skipping: no system Chrome or Chromium executable");
+            return;
+        }
+
+        let temp = tempfile::tempdir().expect("temporary cache directory");
+        let settings = DiscoveryConfig::default();
+        let browser_settings = BrowserConfig::default();
+        let mut browser = BrowserSession::launch(&browser_settings, NavigationPolicy::production())
+            .await
+            .expect("launch browser");
+        let engine = DiscoveryEngine::production(temp.path());
+
+        let discovery = engine.discover_and_validate(&mut browser, &settings).await;
+
+        browser.shutdown().await.expect("shutdown browser");
+        let outcome = discovery.expect("live discovery should find a rendered search form");
+        eprintln!(
+            "live discovery validated {} candidate(s) and skipped {} attempt(s)",
+            outcome.candidates.len(),
+            outcome.failures.len()
+        );
+        assert!(!outcome.candidates.is_empty());
+    }
 }

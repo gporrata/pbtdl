@@ -17,6 +17,19 @@ The first release is a local, single-user CLI. It preserves the useful interacti
 
 There is no web UI, hosted service, or built-in BitTorrent implementation.
 
+## Requirements and usage
+
+Building `pbtdl` requires Rust 1.85 or newer. Runtime discovery and search require a system installation of Chrome or Chromium. Completing a download additionally requires `aria2c`; the browser and downloader are not bundled.
+
+```sh
+cargo build --release
+./target/release/pbtdl "a lawful search query" --dry-run
+```
+
+Interactive selection is the default. Add `--auto` to select the highest-ranked eligible result explicitly, `--output <DIRECTORY>` to choose the destination, or omit `--dry-run` to invoke `aria2c`. `--headful` shows Chromium for deterministic troubleshooting. Run `pbtdl --help` for the complete CLI contract.
+
+The first invocation creates the commented XDG configuration if it is missing and then continues with those defaults. Edit that file to change discovery sources, direct seed candidates, timeouts, result presentation, the browser executable, or downloader settings. Existing configuration is never overwritten.
+
 ## End-to-end design
 
 ```text
@@ -148,6 +161,18 @@ Browser-specific details do not leak into downloader code, and client-specific b
 Automated tests do not depend on live proxy sites and never download torrent content. Parser and fallback behavior is tested with sanitized HTML fixtures and local test pages. Downloader behavior is tested with fake executables that record their argument arrays. Configuration tests use isolated temporary XDG directories.
 
 An opt-in live smoke test may verify that configured discovery pages can still be rendered and that at least one candidate has a recognizable search form. Live failures are diagnostic signals, not part of the deterministic unit-test suite.
+
+Run the complete local Chromium workflow, including failed-candidate fallback and a fake downloader, with:
+
+```sh
+cargo test complete_local_workflow_uses_fallback_and_fake_downloader -- --ignored --nocapture
+```
+
+The separately opt-in live diagnostic performs rendered discovery and candidate-form validation only. It never submits a search, selects a result, or invokes a downloader:
+
+```sh
+PBTDL_LIVE_DISCOVERY=1 cargo test live_discovery_diagnostic_only -- --ignored --nocapture
+```
 
 All normal commits are expected to leave formatting, compilation, linting, and tests passing. Failures should identify which stage and candidate failed without exposing unrelated browser or environment data.
 

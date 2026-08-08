@@ -121,7 +121,10 @@ impl LocalDownloader {
     }
 
     #[cfg(test)]
-    fn with_path_entries(preference: DownloaderPreference, path_entries: Vec<PathBuf>) -> Self {
+    pub(crate) fn with_path_entries(
+        preference: DownloaderPreference,
+        path_entries: Vec<PathBuf>,
+    ) -> Self {
         Self {
             preference,
             path_entries,
