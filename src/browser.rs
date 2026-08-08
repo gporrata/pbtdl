@@ -4,8 +4,10 @@ use crate::config::BrowserConfig as AppBrowserConfig;
 use chromiumoxide::cdp::browser_protocol::browser::{
     SetDownloadBehaviorBehavior, SetDownloadBehaviorParams,
 };
+use chromiumoxide::cdp::browser_protocol::target::TargetId;
 use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures::StreamExt;
+use std::collections::HashSet;
 use std::ffi::OsString;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -66,7 +68,7 @@ impl NavigationPolicy {
     }
 
     #[cfg(test)]
-    fn local_test_pages() -> Self {
+    pub(crate) fn local_test_pages() -> Self {
         Self {
             allow_local_test_pages: true,
         }
@@ -145,6 +147,7 @@ pub struct BrowserSession {
     handler_task: Option<JoinHandle<Result<(), String>>>,
     profile: Option<TempDir>,
     page: Option<Page>,
+    initial_targets: HashSet<TargetId>,
     navigation_timeout: Duration,
     deadline: Instant,
     policy: NavigationPolicy,
@@ -196,9 +199,11 @@ impl BrowserSession {
             });
         }
 
+        let mut initial_targets = HashSet::new();
         if browser.fetch_targets().await.is_ok() {
             if let Ok(pages) = browser.pages().await {
                 for page in pages {
+                    initial_targets.insert(page.target_id().clone());
                     let _ = page.close().await;
                 }
             }
@@ -209,6 +214,7 @@ impl BrowserSession {
             handler_task: Some(handler_task),
             profile: Some(profile),
             page: None,
+            initial_targets,
             navigation_timeout,
             deadline,
             policy,
@@ -346,11 +352,12 @@ impl BrowserSession {
         let mut unexpected = false;
         for page in pages {
             if page.target_id() != &active_id {
-                let is_browser_created_blank = page.opener_id().is_none()
-                    && matches!(
-                        page.url().await.ok().flatten().as_deref(),
-                        Some("about:blank") | Some("chrome://newtab/")
-                    );
+                let is_browser_created_blank = self.initial_targets.contains(page.target_id())
+                    || (page.opener_id().is_none()
+                        && matches!(
+                            page.url().await.ok().flatten().as_deref(),
+                            Some("about:blank") | Some("chrome://newtab/")
+                        ));
                 unexpected |= !is_browser_created_blank;
                 let _ = page.close().await;
             }
