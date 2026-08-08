@@ -111,7 +111,7 @@ pub enum MagnetError {
 pub struct TorrentResult {
     pub name: String,
     pub magnet: MagnetUri,
-    pub seeders: u64,
+    pub seeders: Option<u64>,
     pub leechers: Option<u64>,
     pub size_bytes: Option<u64>,
     pub category: Option<String>,

@@ -141,14 +141,23 @@ pub struct RenderedDocument {
     pub html: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrowserFormTarget {
+    pub form_index: usize,
+    pub input_index: usize,
+    pub input_name: Option<String>,
+    pub input_id: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct BrowserSession {
     browser: Option<Browser>,
     handler_task: Option<JoinHandle<Result<(), String>>>,
     profile: Option<TempDir>,
     page: Option<Page>,
-    initial_targets: HashSet<TargetId>,
+    ignored_targets: HashSet<TargetId>,
     navigation_timeout: Duration,
+    selector_timeout: Duration,
     deadline: Instant,
     policy: NavigationPolicy,
 }
@@ -165,6 +174,7 @@ impl BrowserSession {
             .map_err(|error| BrowserError::Launch(error.to_string()))?;
         let navigation_timeout = Duration::from_secs(settings.navigation_timeout_seconds);
         let overall_timeout = Duration::from_secs(settings.overall_timeout_seconds);
+        let selector_timeout = Duration::from_secs(settings.selector_timeout_seconds);
         let deadline = Instant::now() + overall_timeout;
         let plan = BrowserLaunchPlan {
             executable,
@@ -199,11 +209,11 @@ impl BrowserSession {
             });
         }
 
-        let mut initial_targets = HashSet::new();
+        let mut ignored_targets = HashSet::new();
         if browser.fetch_targets().await.is_ok() {
             if let Ok(pages) = browser.pages().await {
                 for page in pages {
-                    initial_targets.insert(page.target_id().clone());
+                    ignored_targets.insert(page.target_id().clone());
                     let _ = page.close().await;
                 }
             }
@@ -214,8 +224,9 @@ impl BrowserSession {
             handler_task: Some(handler_task),
             profile: Some(profile),
             page: None,
-            initial_targets,
+            ignored_targets,
             navigation_timeout,
+            selector_timeout,
             deadline,
             policy,
         })
@@ -225,7 +236,11 @@ impl BrowserSession {
         self.ensure_handler_running().await?;
         let operation_timeout = self.operation_timeout("navigation")?;
         self.policy.validate(url, operation_timeout).await?;
+        if self.page.is_some() {
+            self.reject_unexpected_pages().await?;
+        }
         self.close_active_page().await;
+        self.capture_idle_targets().await?;
 
         let browser = self.browser.as_ref().ok_or(BrowserError::PrematureExit)?;
         let page = timed(
@@ -263,6 +278,79 @@ impl BrowserSession {
         let html = self.current_content().await?;
         self.reject_unexpected_pages().await?;
         Ok(RenderedDocument { url, html })
+    }
+
+    pub async fn submit_form(
+        &mut self,
+        target: &BrowserFormTarget,
+        query: &str,
+    ) -> BrowserResult<()> {
+        self.ensure_handler_running().await?;
+        let page = self.page.as_ref().ok_or(BrowserError::NoActivePage)?;
+        let query = serde_json::to_string(query).map_err(|error| BrowserError::Operation {
+            stage: "form submission",
+            message: error.to_string(),
+        })?;
+        let input_name =
+            serde_json::to_string(&target.input_name).map_err(|error| BrowserError::Operation {
+                stage: "form submission",
+                message: error.to_string(),
+            })?;
+        let input_id =
+            serde_json::to_string(&target.input_id).map_err(|error| BrowserError::Operation {
+                stage: "form submission",
+                message: error.to_string(),
+            })?;
+        let script = format!(
+            r#"(() => {{
+                const form = Array.from(document.forms)[{form_index}];
+                if (!form) return {{ok: false, reason: "form missing"}};
+                const inputs = Array.from(form.querySelectorAll("input"));
+                const expectedName = {input_name};
+                const expectedId = {input_id};
+                let input = inputs[{input_index}];
+                if (expectedId && (!input || input.id !== expectedId)) {{
+                    input = form.querySelector(`#${{CSS.escape(expectedId)}}`);
+                }}
+                if (expectedName && (!input || input.name !== expectedName)) {{
+                    input = Array.from(form.elements).find(element => element.name === expectedName);
+                }}
+                if (!input) return {{ok: false, reason: "query input missing"}};
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set;
+                setter.call(input, {query});
+                input.dispatchEvent(new Event("input", {{bubbles: true}}));
+                input.dispatchEvent(new Event("change", {{bubbles: true}}));
+                setTimeout(() => {{
+                    if (typeof form.requestSubmit === "function") form.requestSubmit();
+                    else form.submit();
+                }}, 0);
+                return {{ok: true}};
+            }})()"#,
+            form_index = target.form_index,
+            input_index = target.input_index,
+        );
+        let duration = self.operation_timeout_with(self.selector_timeout, "form submission")?;
+        let evaluated = timed(duration, "form submission", page.evaluate(script))
+            .await
+            .map_err(|error| map_cdp_error("form submission", error))?;
+        let value: serde_json::Value =
+            evaluated
+                .into_value()
+                .map_err(|error| BrowserError::Operation {
+                    stage: "form submission",
+                    message: error.to_string(),
+                })?;
+        if value.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+            return Err(BrowserError::Operation {
+                stage: "form submission",
+                message: value
+                    .get("reason")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("rendered form could not be submitted")
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub fn profile_path(&self) -> Option<&Path> {
@@ -352,7 +440,7 @@ impl BrowserSession {
         let mut unexpected = false;
         for page in pages {
             if page.target_id() != &active_id {
-                let is_browser_created_blank = self.initial_targets.contains(page.target_id())
+                let is_browser_created_blank = self.ignored_targets.contains(page.target_id())
                     || (page.opener_id().is_none()
                         && matches!(
                             page.url().await.ok().flatten().as_deref(),
@@ -371,8 +459,25 @@ impl BrowserSession {
 
     async fn close_active_page(&mut self) {
         if let Some(page) = self.page.take() {
+            self.ignored_targets.insert(page.target_id().clone());
             let _ = timeout(CLEANUP_TIMEOUT, page.close()).await;
         }
+    }
+
+    async fn capture_idle_targets(&mut self) -> BrowserResult<()> {
+        let duration = self.operation_timeout("window initialization")?;
+        let browser = self.browser.as_mut().ok_or(BrowserError::PrematureExit)?;
+        timed(duration, "window initialization", browser.fetch_targets())
+            .await
+            .map_err(|error| map_cdp_error("window initialization", error))?;
+        let pages = timed(duration, "window initialization", browser.pages())
+            .await
+            .map_err(|error| map_cdp_error("window initialization", error))?;
+        for page in pages {
+            self.ignored_targets.insert(page.target_id().clone());
+            let _ = page.close().await;
+        }
+        Ok(())
     }
 
     async fn ensure_handler_running(&mut self) -> BrowserResult<()> {
@@ -390,11 +495,19 @@ impl BrowserSession {
     }
 
     fn operation_timeout(&self, stage: &'static str) -> BrowserResult<Duration> {
+        self.operation_timeout_with(self.navigation_timeout, stage)
+    }
+
+    fn operation_timeout_with(
+        &self,
+        limit: Duration,
+        stage: &'static str,
+    ) -> BrowserResult<Duration> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return Err(BrowserError::Timeout { stage });
         }
-        Ok(remaining.min(self.navigation_timeout))
+        Ok(remaining.min(limit))
     }
 }
 
